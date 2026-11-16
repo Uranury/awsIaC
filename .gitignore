@@ -1,0 +1,19 @@
+# build output
+/bin/
+/out/
+bootstrap
+*.zip
+
+# local AWS / env files
+.env
+*.pem
+.aws-sam/
+packaged*.yaml
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+sis3.md
+INFRASTRUCTURE.md
+screenshots/

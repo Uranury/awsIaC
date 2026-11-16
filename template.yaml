@@ -1,0 +1,410 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  SIS3 - orders API on ECS Fargate behind an ALB. POST /orders publishes an
+  OrderPlaced event to SNS; SNS fans it out to SQS (with a DLQ); an idempotent
+  Lambda consumer processes it, using a DynamoDB table for deduplication.
+  No resource names are hardcoded: CloudFormation generates them from the stack name.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedPattern: "^[a-z0-9-]{1,20}$"
+    Description: Environment label (tags and app info). The stack name itself scopes every resource.
+  ImageTag:
+    Type: String
+    Default: ""
+    AllowedPattern: "^[A-Za-z0-9._-]*$"
+    Description: >-
+      Tag suffix of the images in this stack's ECR repository (service-<tag>,
+      consumer-<tag>). Empty on the first pass: the repository is created, the
+      ECS service runs 0 tasks and the Lambda consumer is not created yet.
+  DesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 0
+    MaxValue: 10
+    Description: Number of Fargate tasks once an image exists.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for the ALB and the tasks.
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets (at least two AZs) for the ALB and the tasks.
+
+Conditions:
+  HasImage: !Not [!Equals [!Ref ImageTag, ""]]
+
+Resources:
+  # ---------------------------------------------------------------- messaging
+  OrderEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  OrdersDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600 # 14 days: longer than the main queue, messages keep their original enqueue time
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 185 # 6 x Lambda timeout (30 s) + batching window (5 s)
+      MessageRetentionPeriod: 345600 # 4 days
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrdersDeadLetterQueue.Arn
+        maxReceiveCount: 5
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  # Only this stack's topic may send into the queue.
+  OrdersQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref OrdersQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowOrderEventsTopic
+            Effect: Allow
+            Principal: { Service: sns.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt OrdersQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref OrderEventsTopic
+
+  OrdersQueueSubscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: OrdersQueuePolicy
+    Properties:
+      TopicArn: !Ref OrderEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt OrdersQueue.Arn
+      RawMessageDelivery: true
+      FilterPolicyScope: MessageBody
+      FilterPolicy:
+        type: [OrderPlaced]
+
+  DedupeTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: eventId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: eventId, KeyType: HASH }
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  ConsumerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+
+  ConsumerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: consumer
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadQueue
+                Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:ChangeMessageVisibility
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt OrdersQueue.Arn
+              - Sid: Dedupe
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt DedupeTable.Arn
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt ConsumerLogGroup.Arn
+
+  ConsumerFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasImage
+    Properties:
+      PackageType: Image
+      Code:
+        ImageUri: !Sub "${Repository.RepositoryUri}:consumer-${ImageTag}"
+      Architectures: [x86_64]
+      Role: !GetAtt ConsumerRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          DEDUPE_TABLE: !Ref DedupeTable
+      LoggingConfig:
+        LogGroup: !Ref ConsumerLogGroup
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  ConsumerEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: HasImage
+    Properties:
+      EventSourceArn: !GetAtt OrdersQueue.Arn
+      FunctionName: !Ref ConsumerFunction
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig:
+        MaximumConcurrency: 5
+
+  # ---------------------------------------------------------------- container
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      ImageTagMutability: IMMUTABLE
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep the 20 most recent images (10 deploys: service + consumer)",
+                "selection": { "tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 20 },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      # Lets Lambda pull the consumer image for functions in this account.
+      RepositoryPolicyText:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: LambdaImagePull
+            Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action:
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+            Condition:
+              StringLike:
+                aws:sourceArn: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:*"
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  ServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+
+  # Used by the ECS agent: pull the image from ECR, write container logs.
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+
+  # Used by the application code: publish the domain event, read the result.
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: app
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: PublishOrderEvents
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref OrderEventsTopic
+              - Sid: ReadDedupe
+                Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !GetAtt DedupeTable.Arn
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: X86_64
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Essential: true
+          Image: !If
+            - HasImage
+            - !Sub "${Repository.RepositoryUri}:service-${ImageTag}"
+            - !Sub "${Repository.RepositoryUri}:service-none" # never started: DesiredCount is 0 without an image
+          PortMappings:
+            - { ContainerPort: 8080, Protocol: tcp }
+          Environment:
+            - { Name: TOPIC_ARN, Value: !Ref OrderEventsTopic }
+            - { Name: DEDUPE_TABLE, Value: !Ref DedupeTable }
+            - { Name: APP_VERSION, Value: !Sub "${EnvironmentName}/${ImageTag}" }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ServiceLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AWS::StackName} ALB - HTTP from the internet"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AWS::StackName} tasks - 8080 from the ALB only"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets: !Ref SubnetIds
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      VpcId: !Ref VpcId
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !If [HasImage, !Ref DesiredCount, 0]
+      HealthCheckGracePeriodSeconds: 30
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED # public subnets, no NAT: tasks reach ECR/SNS/DynamoDB directly
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref TaskSecurityGroup]
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroup
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+Outputs:
+  AlbUrl:
+    Description: Public URL of the API
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+  EcrRepositoryUri:
+    Description: ECR repository for the service and consumer images
+    Value: !GetAtt Repository.RepositoryUri
+  QueueUrl:
+    Description: Main SQS queue
+    Value: !Ref OrdersQueue
+  DeadLetterQueueUrl:
+    Value: !Ref OrdersDeadLetterQueue
+  TopicArn:
+    Value: !Ref OrderEventsTopic
+  DedupeTableName:
+    Value: !Ref DedupeTable
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  ServiceLogGroupName:
+    Value: !Ref ServiceLogGroup
+  ConsumerLogGroupName:
+    Value: !Ref ConsumerLogGroup
+  ConsumerFunctionName:
+    Condition: HasImage
+    Value: !Ref ConsumerFunction
+  ImageTag:
+    Value: !Ref ImageTag
