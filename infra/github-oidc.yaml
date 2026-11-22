@@ -100,6 +100,9 @@ Resources:
                   - cloudformation:DescribeStackEvents
                   - cloudformation:DescribeStackResource
                   - cloudformation:DescribeStackResources
+                  # "aws cloudformation deploy" reads the existing stack's
+                  # parameters with this before every update.
+                  - cloudformation:GetTemplateSummary
                 Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppStackName}/*"
               # A change set may only be created with the service role, so the
               # resource changes run with that role's permissions, not this one's.
