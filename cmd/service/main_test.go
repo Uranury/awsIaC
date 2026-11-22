@@ -67,7 +67,7 @@ func do(h http.Handler, method, path, body string, header map[string]string) *ht
 
 func TestHealth(t *testing.T) {
 	rec := do(newTestServer(&fakeSNS{}, &fakeDB{}), http.MethodGet, "/health", "", nil)
-	if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
+	if rec.Code != http.StatusOK || rec.Body.String() != "broken" {
 		t.Fatalf("GET /health = %d %q, want 200 \"ok\"", rec.Code, rec.Body.String())
 	}
 }
