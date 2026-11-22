@@ -334,6 +334,12 @@ Resources:
                 Condition:
                   ArnLike:
                     lambda:FunctionArn: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppStackName}-*"
+              # The mapping's delete handler checks the mapping with this call on
+              # resource "*", so the scoped statement below is not enough for it.
+              - Sid: LambdaEventSourceMappingRead
+                Effect: Allow
+                Action: lambda:GetEventSourceMapping
+                Resource: "*"
               - Sid: LambdaEventSourceMappings
                 Effect: Allow
                 Action:
