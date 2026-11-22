@@ -174,11 +174,14 @@ jobs:
           blocked=0
           for target in service consumer; do
             tag="$target-$IMAGE_TAG"
+            # --no-paginate on every call: while a scan is running the response has
+            # no imageScanFindings, and the CLI's paginator crashes on that
+            # ("'NoneType' object does not support item assignment").
             # Scan on push starts a few seconds after the push. Until then ECR
             # answers ScanNotFoundException, which the waiter treats as a
             # failure, so first wait (up to 2 minutes) for the scan to exist.
             for i in $(seq 1 24); do
-              if err="$(aws ecr describe-image-scan-findings --repository-name "$REPO_NAME" \
+              if err="$(aws ecr describe-image-scan-findings --no-paginate --repository-name "$REPO_NAME" \
                   --image-id imageTag="$tag" --query 'imageScanStatus.status' --output text 2>&1)"; then
                 echo "$tag: scan $err"
                 break
@@ -194,21 +197,22 @@ jobs:
               sleep 5
             done
             if ! aws ecr wait image-scan-complete --repository-name "$REPO_NAME" --image-id imageTag="$tag"; then
-              aws ecr describe-image-scan-findings --repository-name "$REPO_NAME" --image-id imageTag="$tag" \
+              aws ecr describe-image-scan-findings --no-paginate --repository-name "$REPO_NAME" --image-id imageTag="$tag" \
                 --query 'imageScanStatus' --output json || true
               echo "::error::scan of $tag did not complete"
               exit 1
             fi
-            counts="$(aws ecr describe-image-scan-findings --repository-name "$REPO_NAME" --image-id imageTag="$tag" \
+            counts="$(aws ecr describe-image-scan-findings --no-paginate --repository-name "$REPO_NAME" --image-id imageTag="$tag" \
               --query 'imageScanFindings.findingSeverityCounts' --output json)"
             # The CRITICAL key is missing (not 0) when there are none.
-            critical="$(aws ecr describe-image-scan-findings --repository-name "$REPO_NAME" --image-id imageTag="$tag" \
+            critical="$(aws ecr describe-image-scan-findings --no-paginate --repository-name "$REPO_NAME" --image-id imageTag="$tag" \
               --query 'imageScanFindings.findingSeverityCounts.CRITICAL' --output text)"
             [[ "$critical" == "None" ]] && critical=0
+            [[ -z "$counts" || "$counts" == "null" ]] && counts="no findings"
             echo "$tag: ${counts//$'\n'/ }"
             if (( critical > 0 )); then
               echo "::error::$tag has $critical CRITICAL finding(s)"
-              aws ecr describe-image-scan-findings --repository-name "$REPO_NAME" --image-id imageTag="$tag" \
+              aws ecr describe-image-scan-findings --no-paginate --repository-name "$REPO_NAME" --image-id imageTag="$tag" \
                 --query "imageScanFindings.findings[?severity=='CRITICAL'].[name,uri]" --output text || true
               blocked=1
             fi
