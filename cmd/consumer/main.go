@@ -52,8 +52,15 @@ type orderPlaced struct {
 
 var errInFlight = errors.New("event is being processed by another worker")
 
+// dedupeStore is the part of the DynamoDB client the consumer uses; tests replace it with a fake.
+type dedupeStore interface {
+	PutItem(ctx context.Context, in *dynamodb.PutItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
+	UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error)
+	DeleteItem(ctx context.Context, in *dynamodb.DeleteItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.DeleteItemOutput, error)
+}
+
 type consumer struct {
-	db    *dynamodb.Client
+	db    dedupeStore
 	table string
 	log   *slog.Logger
 }
@@ -153,9 +160,9 @@ func (c *consumer) claim(ctx context.Context, eventID string) (bool, error) {
 // complete records the order on the dedupe row and marks it COMPLETED.
 func (c *consumer) complete(ctx context.Context, ev orderPlaced) error {
 	_, err := c.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName:        aws.String(c.table),
-		Key:              map[string]types.AttributeValue{"eventId": s(ev.EventID)},
-		UpdateExpression: aws.String("SET #st = :done, orderId = :oid, amount = :amt, customer = :cus, processedAt = :at REMOVE lockedUntil"),
+		TableName:                aws.String(c.table),
+		Key:                      map[string]types.AttributeValue{"eventId": s(ev.EventID)},
+		UpdateExpression:         aws.String("SET #st = :done, orderId = :oid, amount = :amt, customer = :cus, processedAt = :at REMOVE lockedUntil"),
 		ExpressionAttributeNames: map[string]string{"#st": "status"},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":done": s(completed),

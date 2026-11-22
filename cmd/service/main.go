@@ -49,9 +49,19 @@ type orderPlaced struct {
 	OccurredAt      string  `json:"occurredAt"`
 }
 
+// publisher and itemGetter are the parts of the SNS and DynamoDB clients the
+// server uses; tests replace them with fakes.
+type publisher interface {
+	Publish(ctx context.Context, in *sns.PublishInput, optFns ...func(*sns.Options)) (*sns.PublishOutput, error)
+}
+
+type itemGetter interface {
+	GetItem(ctx context.Context, in *dynamodb.GetItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error)
+}
+
 type server struct {
-	sns      *sns.Client
-	db       *dynamodb.Client
+	sns      publisher
+	db       itemGetter
 	topicArn string
 	table    string
 	version  string
@@ -77,15 +87,7 @@ func main() {
 		log:      log,
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
-		w.Write([]byte("ok"))
-	})
-	mux.HandleFunc("GET /{$}", s.info)
-	mux.HandleFunc("POST /orders", s.placeOrder)
-	mux.HandleFunc("GET /orders/{eventId}", s.getEvent)
-
-	srv := &http.Server{Addr: ":8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: ":8080", Handler: s.routes(), ReadHeaderTimeout: 5 * time.Second}
 
 	// ECS sends SIGTERM on stop; finish in-flight requests before exiting.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -102,6 +104,17 @@ func main() {
 		log.Error("server", "error", err.Error())
 		os.Exit(1)
 	}
+}
+
+func (s *server) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("GET /{$}", s.info)
+	mux.HandleFunc("POST /orders", s.placeOrder)
+	mux.HandleFunc("GET /orders/{eventId}", s.getEvent)
+	return mux
 }
 
 func (s *server) info(w http.ResponseWriter, _ *http.Request) {
