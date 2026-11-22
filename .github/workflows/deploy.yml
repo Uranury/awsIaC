@@ -1,0 +1,259 @@
+# Test, build and deploy on every push to master (and on demand).
+#
+# AWS access is through GitHub OIDC only: the deploy job gets a short-lived
+# token from GitHub, exchanges it for temporary credentials of the deploy role
+# (vars.DEPLOY_ROLE_ARN, created by infra/github-oidc.yaml), and those expire
+# when the job ends. There are no AWS keys in this repository or its secrets.
+#
+# The steps mirror deploy.sh: deploy the template (keeps the running image),
+# build and push the images tagged with the commit SHA, deploy again with
+# ImageTag=<sha>, then check the ALB and print what is running.
+name: deploy
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+# Never run two deploys of the stack at once, and never cancel one half-way.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Tests run in their own job, without id-token permission, so a failing (or
+  # malicious) test never gets anywhere near AWS credentials. The deploy job
+  # only starts when this one has passed.
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (with module and build cache)
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l cmd)"
+          if [[ -n "$unformatted" ]]; then
+            echo "::error::run gofmt -w on: $unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -race -count=1 ./...
+
+  deploy:
+    name: Deploy to production
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # The OIDC token's subject ends in ":environment:production"; the role's
+    # trust policy accepts nothing else.
+    environment:
+      name: production
+      url: ${{ steps.smoke.outputs.url }}
+    permissions:
+      id-token: write # request the OIDC token
+      contents: read # check out the code
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      STACK_NAME: ${{ vars.STACK_NAME }}
+      VPC_ID: ${{ vars.VPC_ID }}
+      SUBNET_IDS: ${{ vars.SUBNET_IDS }}
+      CFN_ROLE_ARN: ${{ vars.CFN_ROLE_ARN }}
+      ENVIRONMENT: production
+      DESIRED_COUNT: "2"
+      IMAGE_TAG: ${{ github.sha }}
+      AWS_PAGER: ""
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the GitHub variables
+        run: |
+          missing=0
+          for v in AWS_REGION STACK_NAME VPC_ID SUBNET_IDS CFN_ROLE_ARN; do
+            if [[ -z "${!v}" ]]; then echo "::error::variable $v is not set in the production environment"; missing=1; fi
+          done
+          [[ -n "${{ vars.DEPLOY_ROLE_ARN }}" ]] || { echo "::error::variable DEPLOY_ROLE_ARN is not set"; missing=1; }
+          exit "$missing"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          role-session-name: gha-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Show the assumed role
+        run: aws sts get-caller-identity --query Arn --output text
+
+      - name: Check the stack can be updated
+        run: |
+          status="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo NONE)"
+          echo "stack $STACK_NAME: $status"
+          if [[ "$status" == "ROLLBACK_COMPLETE" ]]; then
+            echo "::error::$STACK_NAME is in ROLLBACK_COMPLETE (its first create failed). Delete it by hand (./teardown.sh $STACK_NAME) and re-run."
+            exit 1
+          fi
+
+      - name: Deploy template (keep the current image)
+        run: |
+          aws cloudformation deploy \
+            --stack-name "$STACK_NAME" \
+            --template-file template.yaml \
+            --role-arn "$CFN_ROLE_ARN" \
+            --capabilities CAPABILITY_IAM \
+            --no-fail-on-empty-changeset \
+            --tags "Project=sis3" "Stack=$STACK_NAME" \
+            --parameter-overrides "EnvironmentName=$ENVIRONMENT" "VpcId=$VPC_ID" "SubnetIds=$SUBNET_IDS"
+
+      - name: Read stack outputs and log in to ECR
+        id: ecr
+        run: |
+          repo_uri="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='EcrRepositoryUri'].OutputValue" --output text)"
+          [[ -n "$repo_uri" && "$repo_uri" != "None" ]] || { echo "::error::no EcrRepositoryUri output"; exit 1; }
+          echo "repo_uri=$repo_uri" >> "$GITHUB_OUTPUT"
+          echo "repo_name=${repo_uri#*/}" >> "$GITHUB_OUTPUT"
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${repo_uri%%/*}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build and push images (skip tags that already exist)
+        env:
+          REPO_URI: ${{ steps.ecr.outputs.repo_uri }}
+          REPO_NAME: ${{ steps.ecr.outputs.repo_name }}
+        run: |
+          for target in service consumer; do
+            tag="$target-$IMAGE_TAG"
+            # Tags are immutable: a re-run of the same commit reuses the image
+            # instead of failing on push (build once, deploy that artifact).
+            if err="$(aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag="$tag" 2>&1 >/dev/null)"; then
+              echo "$REPO_URI:$tag already exists, not rebuilding"
+              continue
+            elif [[ "$err" != *ImageNotFoundException* ]]; then
+              echo "$err" >&2
+              exit 1
+            fi
+            echo "building $REPO_URI:$tag"
+            # Single-platform image without attestations: Lambda rejects multi-manifest image indexes.
+            docker buildx build \
+              --platform linux/amd64 \
+              --provenance=false --sbom=false \
+              --target "$target" \
+              --tag "$REPO_URI:$tag" \
+              --push .
+          done
+
+      # The repository scans every pushed image (ScanOnPush). Nothing is rolled
+      # out while either image has a CRITICAL finding.
+      - name: Image scan gate (no CRITICAL findings)
+        env:
+          REPO_NAME: ${{ steps.ecr.outputs.repo_name }}
+        run: |
+          blocked=0
+          for target in service consumer; do
+            tag="$target-$IMAGE_TAG"
+            if ! aws ecr wait image-scan-complete --repository-name "$REPO_NAME" --image-id imageTag="$tag"; then
+              aws ecr describe-image-scan-findings --repository-name "$REPO_NAME" --image-id imageTag="$tag" \
+                --query 'imageScanStatus' --output json || true
+              echo "::error::scan of $tag did not complete"
+              exit 1
+            fi
+            counts="$(aws ecr describe-image-scan-findings --repository-name "$REPO_NAME" --image-id imageTag="$tag" \
+              --query 'imageScanFindings.findingSeverityCounts' --output json)"
+            # The CRITICAL key is missing (not 0) when there are none.
+            critical="$(aws ecr describe-image-scan-findings --repository-name "$REPO_NAME" --image-id imageTag="$tag" \
+              --query 'imageScanFindings.findingSeverityCounts.CRITICAL' --output text)"
+            [[ "$critical" == "None" ]] && critical=0
+            echo "$tag: ${counts//$'\n'/ }"
+            if (( critical > 0 )); then
+              echo "::error::$tag has $critical CRITICAL finding(s)"
+              aws ecr describe-image-scan-findings --repository-name "$REPO_NAME" --image-id imageTag="$tag" \
+                --query "imageScanFindings.findings[?severity=='CRITICAL'].[name,uri]" --output text || true
+              blocked=1
+            fi
+          done
+          exit "$blocked"
+
+      - name: Deploy template with ImageTag=${{ github.sha }}
+        run: |
+          aws cloudformation deploy \
+            --stack-name "$STACK_NAME" \
+            --template-file template.yaml \
+            --role-arn "$CFN_ROLE_ARN" \
+            --capabilities CAPABILITY_IAM \
+            --no-fail-on-empty-changeset \
+            --tags "Project=sis3" "Stack=$STACK_NAME" \
+            --parameter-overrides "EnvironmentName=$ENVIRONMENT" "VpcId=$VPC_ID" "SubnetIds=$SUBNET_IDS" \
+              "ImageTag=$IMAGE_TAG" "DesiredCount=$DESIRED_COUNT"
+
+      - name: Smoke test (ALB /health, about 5 minutes)
+        id: smoke
+        run: |
+          url="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='AlbUrl'].OutputValue" --output text)"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "polling $url/health"
+          for i in $(seq 1 60); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url/health" || true)"
+            if [[ "$code" == "200" ]]; then
+              info="$(curl -fsS --max-time 5 "$url/")"
+              echo "healthy after attempt $i: $info"
+              if [[ "$info" != *"$IMAGE_TAG"* ]]; then
+                echo "::error::the ALB answers, but not with version $IMAGE_TAG"
+                exit 1
+              fi
+              exit 0
+            fi
+            echo "attempt $i: HTTP $code"
+            sleep 5
+          done
+          echo "::error::$url/health did not return 200 within 5 minutes"
+          exit 1
+
+      - name: Print the deployed task definition and image tag
+        run: |
+          out() {
+            aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+              --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
+          }
+          cluster="$(out ClusterName)"
+          service="$(out ServiceName)"
+          read -r td running desired < <(aws ecs describe-services --cluster "$cluster" --services "$service" \
+            --query 'services[0].[taskDefinition,runningCount,desiredCount]' --output text)
+          image="$(aws ecs describe-task-definition --task-definition "$td" \
+            --query "taskDefinition.containerDefinitions[?name=='app'].image | [0]" --output text)"
+          report="$(printf '%s\n' \
+            "commit:          $GITHUB_SHA" \
+            "task definition: $td" \
+            "image:           $image" \
+            "image tag:       ${image##*:}" \
+            "tasks:           $running running / $desired desired")"
+          echo "$report"
+          fence='```'
+          printf '### Deployed\n%s\n%s\n%s\n' "$fence" "$report" "$fence" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${image##*:}" != "service-$IMAGE_TAG" ]]; then
+            echo "::error::the service runs ${image##*:}, expected service-$IMAGE_TAG"
+            exit 1
+          fi
