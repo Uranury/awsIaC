@@ -165,6 +165,37 @@ jobs:
               --push .
           done
 
+      # The repository scans every pushed image (ScanOnPush). Nothing is rolled
+      # out while either image has a CRITICAL finding.
+      - name: Image scan gate (no CRITICAL findings)
+        env:
+          REPO_NAME: ${{ steps.ecr.outputs.repo_name }}
+        run: |
+          blocked=0
+          for target in service consumer; do
+            tag="$target-$IMAGE_TAG"
+            if ! aws ecr wait image-scan-complete --repository-name "$REPO_NAME" --image-id imageTag="$tag"; then
+              aws ecr describe-image-scan-findings --repository-name "$REPO_NAME" --image-id imageTag="$tag" \
+                --query 'imageScanStatus' --output json || true
+              echo "::error::scan of $tag did not complete"
+              exit 1
+            fi
+            counts="$(aws ecr describe-image-scan-findings --repository-name "$REPO_NAME" --image-id imageTag="$tag" \
+              --query 'imageScanFindings.findingSeverityCounts' --output json)"
+            # The CRITICAL key is missing (not 0) when there are none.
+            critical="$(aws ecr describe-image-scan-findings --repository-name "$REPO_NAME" --image-id imageTag="$tag" \
+              --query 'imageScanFindings.findingSeverityCounts.CRITICAL' --output text)"
+            [[ "$critical" == "None" ]] && critical=0
+            echo "$tag: ${counts//$'\n'/ }"
+            if (( critical > 0 )); then
+              echo "::error::$tag has $critical CRITICAL finding(s)"
+              aws ecr describe-image-scan-findings --repository-name "$REPO_NAME" --image-id imageTag="$tag" \
+                --query "imageScanFindings.findings[?severity=='CRITICAL'].[name,uri]" --output text || true
+              blocked=1
+            fi
+          done
+          exit "$blocked"
+
       - name: Deploy template with ImageTag=${{ github.sha }}
         run: |
           aws cloudformation deploy \

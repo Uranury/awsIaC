@@ -142,6 +142,7 @@ Resources:
                   - ecr:BatchGetImage
                   - ecr:GetDownloadUrlForLayer
                   - ecr:DescribeImages
+                  - ecr:DescribeImageScanFindings # scan gate
                 Resource: !Sub "arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${AppStackName}-*"
               - Sid: ReadDeployedService
                 Effect: Allow
